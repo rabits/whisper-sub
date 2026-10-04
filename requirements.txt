@@ -1,0 +1,8 @@
+faster-whisper>=1.1.0
+
+# faster-whisper 1.2 calls av.open(..., metadata_errors="ignore").
+# PyAV 19 removed that argument, and a bare av>=11 install picks 19.
+av>=11,<19
+
+# Traditional Chinese conversion for Chinese transcripts.
+opencc-python-reimplemented>=0.1.7
