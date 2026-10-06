@@ -5,7 +5,7 @@ Transcribe local audio and video files with [faster-whisper](https://github.com/
 I found there are not much simple apps to create subtitles, so made this one. It uses CPU and can
 process large files, but that takes ~1/3 of duration (20min per 1hr of audio).
 
-The script writes a transcript next to the audio file. Plain text is the default. Use `-f srt`, `-f vtt`, or `-f json` for subtitles or structured output. The first run downloads the selected model from Hugging Face.
+The script writes a transcript next to the audio file. Plain text is the default. Use `-f srt`, `-f vtt`, or `-f json` for subtitles or structured output. The first run downloads the selected model from Hugging Face. Progress goes to stderr: model load, audio read, then the position in the file. In a terminal that line updates in place.
 
 ```bash
 python3 transcribe.py interview.mp3 -l en -o interview.srt
@@ -24,6 +24,8 @@ python3 transcribe.py interview.mp3 -l en -m small --device cpu --compute-type i
 
 On CPU, `small` with `--compute-type int8` is the practical default. `tiny` and `base` are faster and less accurate. `medium` and `large-v3` are slower.
 
+CTranslate2 uses 4 threads unless told otherwise, so `--cpu-threads` defaults to every logical CPU. One transcription is still a single chain of steps; the extra threads only parallelize the math inside each step. Past the physical cores, and sometimes past a single CPU socket, more threads can get slower. Set `--cpu-threads` lower in that case. Several input files are still transcribed one after another, each using that thread count.
+
 `--device auto` uses a CUDA device when the installed CTranslate2 build can see one, and otherwise uses the CPU. The wheel from PyPI is the CUDA build, so an AMD GPU stays unused in this virtualenv. Use the ROCm image below for AMD.
 
 ## Options
@@ -39,6 +41,7 @@ On CPU, `small` with `--compute-type int8` is the practical default. `tiny` and 
 | `-m, --model` | `tiny`, `base`, `small`, `medium`, `large-v3`, `distil-large-v3`, or `turbo`. |
 | `--device` | `auto`, `cpu`, or `cuda`. ROCm uses `cuda`. |
 | `--compute-type` | `int8` on CPU. `float16` or `int8_float16` on GPU. |
+| `--cpu-threads` | Threads for one transcription. Default: all logical CPUs. `0` selects the same. |
 | `--beam-size` | Search width from 1 to 20. Default: 5. |
 | `--vad-filter` / `--no-vad-filter` | Drop silent stretches. On by default. |
 | `--word-timestamps` | Include per-word times in `json` output. |
@@ -53,6 +56,7 @@ On CPU, `small` with `--compute-type int8` is the practical default. `tiny` and 
 | `WHISPER_MODEL` | `small` | Model used when `--model` is omitted. |
 | `WHISPER_DEVICE` | `auto` | Device used when `--device` is omitted. |
 | `WHISPER_COMPUTE_TYPE` | `default` | Compute type used when `--compute-type` is omitted. |
+| `WHISPER_CPU_THREADS` | all logical CPUs | Thread count when `--cpu-threads` is omitted. `0` means all logical CPUs. |
 | `WHISPER_DOWNLOAD_ROOT` | Hugging Face cache | Directory for downloaded models. The Docker images set this to `/work/.cache/whisper`. |
 | `WHISPER_ZH_CONVERT` | `s2twp` | Default Chinese conversion. |
 

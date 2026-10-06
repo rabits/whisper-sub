@@ -21,7 +21,35 @@ DEFAULT_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "default")
 DEFAULT_ZH_CONVERT = os.getenv("WHISPER_ZH_CONVERT", "s2twp")
 DOWNLOAD_ROOT = os.getenv("WHISPER_DOWNLOAD_ROOT") or None
 
-_models: dict[tuple[str, str, str], object] = {}
+
+def available_cpu_threads() -> int:
+    count = os.cpu_count()
+    return count if count and count > 0 else 1
+
+
+def resolve_cpu_threads(explicit: int | None) -> int:
+    """How many OpenMP threads one transcription should use.
+
+    CTranslate2 stays at 4 threads when this is left unset, which leaves most
+    cores idle. ``0`` means every logical CPU. ``WHISPER_CPU_THREADS`` is the
+    fallback when the flag is omitted; a non-zero count overrides ``OMP_NUM_THREADS``.
+    """
+    if explicit is None:
+        raw = os.getenv("WHISPER_CPU_THREADS", "").strip()
+        if not raw:
+            return available_cpu_threads()
+        try:
+            explicit = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"WHISPER_CPU_THREADS must be an integer, got {raw!r}") from exc
+    if explicit < 0:
+        raise ValueError("cpu_threads must be 0 or a positive number of threads")
+    if explicit == 0:
+        return available_cpu_threads()
+    return explicit
+
+
+_models: dict[tuple[str, str, str, int], object] = {}
 _converters: dict[str, object | None] = {}
 
 
@@ -84,6 +112,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"default, int8, float16, int8_float16, ... (default: {DEFAULT_COMPUTE_TYPE})",
     )
     parser.add_argument("--beam-size", type=int, default=5, metavar="N", help="1-20 (default: 5)")
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "CPU threads for one transcription "
+            f"(default: {available_cpu_threads()}, all logical CPUs). "
+            "0 selects the same. CTranslate2 otherwise uses 4."
+        ),
+    )
     parser.add_argument(
         "--vad-filter",
         action=argparse.BooleanOptionalAction,
@@ -168,6 +207,63 @@ def stamp(seconds: float, srt: bool = False) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds_part:02d}{separator}{ms:03d}"
 
 
+def clock(seconds: float) -> str:
+    return stamp(seconds).rsplit(".", 1)[0]
+
+
+class Progress:
+    """Audio-time progress on stderr.
+
+    A terminal gets one updating line. Anywhere else, a new line is written
+    when the integer percent advances, so a log stays readable.
+    """
+
+    def __init__(self, total: float, language: str, stream=None):
+        self.total = max(0.0, float(total))
+        self.language = (language or "?").strip() or "?"
+        self.stream = sys.stderr if stream is None else stream
+        self.tty = self.stream.isatty()
+        self.segments = 0
+        self._width = 0
+        self._mark = -1
+
+    def render(self, position: float, segments: int, status: str = "") -> tuple[str, float]:
+        if self.total <= 0:
+            pct = 100.0 if segments else 0.0
+            position = 0.0
+        else:
+            position = min(max(0.0, position), self.total)
+            pct = position / self.total * 100.0
+        filled = min(20, max(0, round(20 * pct / 100.0)))
+        bar = "#" * filled + "-" * (20 - filled)
+        tail = status if status else f"{segments} segments"
+        line = (
+            f"  {self.language:<5} [{bar}] {pct:5.1f}%"
+            f"  {clock(position)} / {clock(self.total)}  {tail}"
+        )
+        return line, pct
+
+    def update(self, position: float, segments: int, status: str = "") -> None:
+        self.segments = segments
+        line, pct = self.render(position, segments, status)
+        if self.tty:
+            pad = " " * max(0, self._width - len(line))
+            self.stream.write("\r" + line + pad)
+            self.stream.flush()
+            self._width = len(line)
+            return
+        mark = int(pct)
+        if status or mark > self._mark:
+            print(line, file=self.stream, flush=True)
+            self._mark = mark
+
+    def close(self) -> None:
+        if self.tty and self._width:
+            self.stream.write("\n")
+            self.stream.flush()
+            self._width = 0
+
+
 def render(result: dict, fmt: str) -> str:
     if fmt == "json":
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -222,8 +318,8 @@ def to_traditional(result: dict, config: str) -> dict:
     return result
 
 
-def get_model(model: str, device: str, compute_type: str):
-    key = (model, device, compute_type)
+def get_model(model: str, device: str, compute_type: str, cpu_threads: int):
+    key = (model, device, compute_type, cpu_threads)
     cached = _models.get(key)
     if cached is None:
         try:
@@ -235,10 +331,12 @@ def get_model(model: str, device: str, compute_type: str):
             ) from exc
         if DOWNLOAD_ROOT:
             Path(DOWNLOAD_ROOT).mkdir(parents=True, exist_ok=True)
+        print(f"loading {model} ({device}, {compute_type})", file=sys.stderr, flush=True)
         cached = WhisperModel(
             model,
             device=device,
             compute_type=compute_type,
+            cpu_threads=cpu_threads,
             download_root=DOWNLOAD_ROOT,
         )
         _models[key] = cached
@@ -263,6 +361,7 @@ def transcribe(
     device: str,
     compute_type: str,
     beam_size: int,
+    cpu_threads: int,
     vad_filter: bool,
     word_timestamps: bool,
     initial_prompt: str,
@@ -280,11 +379,14 @@ def transcribe(
         raise ValueError("output_format must be json, text, srt, or vtt")
     if not 1 <= beam_size <= 20:
         raise ValueError("beam_size must be between 1 and 20")
+    if cpu_threads < 1:
+        raise ValueError("cpu_threads must be a positive number of threads")
 
     selected_model = model.strip() or DEFAULT_MODEL
     selected_device = device.strip() or DEFAULT_DEVICE
     selected_compute = compute_type.strip() or DEFAULT_COMPUTE_TYPE
-    whisper = get_model(selected_model, selected_device, selected_compute)
+    whisper = get_model(selected_model, selected_device, selected_compute, cpu_threads)
+    print(f"reading {source.name}", file=sys.stderr, flush=True)
     iterator, info = whisper.transcribe(
         str(source),
         language=language.strip() or None,
@@ -296,25 +398,32 @@ def transcribe(
     )
     segments = []
     parts = []
-    for segment in iterator:
-        item = {
-            "id": segment.id,
-            "start": round(segment.start, 3),
-            "end": round(segment.end, 3),
-            "text": segment.text,
-        }
-        if word_timestamps and segment.words:
-            item["words"] = [
-                {
-                    "start": round(word.start, 3),
-                    "end": round(word.end, 3),
-                    "word": word.word,
-                    "probability": round(word.probability, 5),
-                }
-                for word in segment.words
-            ]
-        segments.append(item)
-        parts.append(segment.text)
+    progress = Progress(info.duration, info.language)
+    progress.update(0, 0, "detecting speech" if vad_filter else "starting")
+    try:
+        for segment in iterator:
+            item = {
+                "id": segment.id,
+                "start": round(segment.start, 3),
+                "end": round(segment.end, 3),
+                "text": segment.text,
+            }
+            if word_timestamps and segment.words:
+                item["words"] = [
+                    {
+                        "start": round(word.start, 3),
+                        "end": round(word.end, 3),
+                        "word": word.word,
+                        "probability": round(word.probability, 5),
+                    }
+                    for word in segment.words
+                ]
+            segments.append(item)
+            parts.append(segment.text)
+            progress.update(segment.end, len(segments))
+        progress.update(info.duration, len(segments))
+    finally:
+        progress.close()
 
     result = {
         "source": str(source),
@@ -354,6 +463,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--stdout and --output cannot be used together")
     if not 1 <= args.beam_size <= 20:
         parser.error("beam_size must be between 1 and 20")
+    try:
+        cpu_threads = resolve_cpu_threads(args.cpu_threads)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     multiple = len(args.audio) > 1
     fmt = infer_format(args.output_format, args.output)
@@ -375,9 +488,11 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             parser.error(str(exc))
 
+    device_label = (args.device.strip() or DEFAULT_DEVICE).lower()
+    detail = fmt if device_label == "cuda" else f"{fmt}, {cpu_threads} cpu threads"
     failures = 0
     for index, (source, dest) in enumerate(planned):
-        print(f"{args.task} {source.name} ({fmt})", file=sys.stderr, flush=True)
+        print(f"{args.task} {source.name} ({detail})", file=sys.stderr, flush=True)
         try:
             transcript = transcribe(
                 source,
@@ -387,6 +502,7 @@ def main(argv: list[str] | None = None) -> int:
                 device=args.device,
                 compute_type=args.compute_type,
                 beam_size=args.beam_size,
+                cpu_threads=cpu_threads,
                 vad_filter=args.vad_filter,
                 word_timestamps=args.word_timestamps,
                 initial_prompt=args.initial_prompt,
